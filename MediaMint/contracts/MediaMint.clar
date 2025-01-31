@@ -1,4 +1,4 @@
-;; MediaMintContract - Digital Asset Monetization Platform
+;; MediaMintContract - Digital Asset Platform
 ;; Enables creators to monetize digital assets through subscriptions and individual purchases
 
 ;; Error Codes
@@ -123,6 +123,7 @@
     (enterprise_price uint))
     (begin
         ;; Validate that the asset exists
+        (asserts! (> asset_identifier u0) ERROR_INVALID_DIGITAL_ASSET_ID)
         (unwrap! (map-get? digital_asset_registry { asset_identifier: asset_identifier }) ERROR_DIGITAL_ASSET_NOT_FOUND)
         
         ;; Ensure the caller is the asset creator
@@ -157,7 +158,7 @@
     (tier (string-ascii 20)))
     (let
         (
-            ;; Retrieve the asset details
+            ;; Validate asset identifier
             (digital_asset (unwrap! 
                 (map-get? digital_asset_registry { asset_identifier: asset_identifier }) 
                 ERROR_DIGITAL_ASSET_NOT_FOUND))
@@ -225,13 +226,14 @@
 (define-public (purchase_digital_asset (asset_identifier uint))
     (let
         (
-            (digital_asset (unwrap! (map-get? digital_asset_registry { asset_identifier: asset_identifier }) ERROR_DIGITAL_ASSET_NOT_FOUND))
+            (digital_asset (unwrap! 
+                (map-get? digital_asset_registry { asset_identifier: asset_identifier }) 
+                ERROR_DIGITAL_ASSET_NOT_FOUND))
             (revenue_split (calculate_revenue_distribution (get purchase_price digital_asset)))
             (content_creator (get content_creator digital_asset))
             (current_block stacks-block-height)
         )
         
-        (asserts! (> asset_identifier u0) ERROR_INVALID_DIGITAL_ASSET_ID)
         (asserts! (not (is_license_currently_valid tx-sender asset_identifier)) ERROR_ASSET_ALREADY_OWNED)
         
         (try! (transfer_stx_funds (get purchase_price digital_asset) (as-contract tx-sender)))
@@ -240,8 +242,10 @@
         (map-set creator_earnings
             { content_creator: content_creator }
             {
-                accumulated_balance: (+ (default-to u0 (get accumulated_balance (map-get? creator_earnings { content_creator: content_creator })))
-                                       (get creator_share revenue_split))
+                accumulated_balance: (+ 
+                    (default-to u0 (get accumulated_balance 
+                        (map-get? creator_earnings { content_creator: content_creator })))
+                    (get creator_share revenue_split))
             }
         )
         
