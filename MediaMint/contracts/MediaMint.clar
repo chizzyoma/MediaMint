@@ -12,6 +12,8 @@
 (define-constant ERROR_INVALID_DIGITAL_ASSET_ID (err u8))
 (define-constant ERROR_INVALID_METADATA_URI (err u9))
 (define-constant ERROR_INVALID_ADMIN_ADDRESS (err u10))
+(define-constant ERROR_INVALID_LICENSE_TIER (err u11))
+(define-constant ERROR_TIER_NOT_CONFIGURED (err u12))
 
 ;; Platform Configuration
 (define-data-var platform_administrator principal tx-sender)
@@ -30,12 +32,24 @@
     }
 )
 
+;; New map for license tiers
+(define-map asset_licensing_tiers
+    { asset_identifier: uint }
+    {
+        basic_license_price: uint,
+        premium_license_price: uint,
+        enterprise_license_price: uint
+    }
+)
+
+;; User asset licenses map - extended to include tier information
 (define-map user_asset_licenses
     { license_holder: principal, asset_identifier: uint }
     {
         acquisition_block_height: uint,
         subscription_expiration_block: uint,
-        license_active: bool
+        license_active: bool,
+        license_tier: (string-ascii 20)
     }
 )
 
@@ -101,6 +115,113 @@
     )
 )
 
+;; New function to configure license tiers for an asset
+(define-public (configure_asset_licensing_tiers 
+    (asset_identifier uint)
+    (basic_price uint)
+    (premium_price uint)
+    (enterprise_price uint))
+    (begin
+        ;; Validate that the asset exists
+        (unwrap! (map-get? digital_asset_registry { asset_identifier: asset_identifier }) ERROR_DIGITAL_ASSET_NOT_FOUND)
+        
+        ;; Ensure the caller is the asset creator
+        (asserts! (is-eq tx-sender 
+            (unwrap-panic (get content_creator (map-get? digital_asset_registry { asset_identifier: asset_identifier }))))
+            ERROR_UNAUTHORIZED)
+        
+        ;; Validate prices
+        (asserts! (and 
+            (> basic_price u0) 
+            (> premium_price basic_price) 
+            (> enterprise_price premium_price)) 
+            ERROR_INVALID_PRICING)
+        
+        ;; Set license tiers
+        (map-set asset_licensing_tiers
+            { asset_identifier: asset_identifier }
+            {
+                basic_license_price: basic_price,
+                premium_license_price: premium_price,
+                enterprise_license_price: enterprise_price
+            }
+        )
+        
+        (ok true)
+    )
+)
+
+;; Modified purchase function to support license tiers
+(define-public (purchase_license_tier 
+    (asset_identifier uint) 
+    (tier (string-ascii 20)))
+    (let
+        (
+            ;; Retrieve the asset details
+            (digital_asset (unwrap! 
+                (map-get? digital_asset_registry { asset_identifier: asset_identifier }) 
+                ERROR_DIGITAL_ASSET_NOT_FOUND))
+            
+            ;; Retrieve the licensing tiers
+            (license_tiers (unwrap! 
+                (map-get? asset_licensing_tiers { asset_identifier: asset_identifier }) 
+                ERROR_TIER_NOT_CONFIGURED))
+            
+            ;; Determine the price based on the selected tier
+            (tier_price 
+                (if (is-eq tier "basic")
+                    (get basic_license_price license_tiers)
+                    (if (is-eq tier "premium")
+                        (get premium_license_price license_tiers)
+                        (if (is-eq tier "enterprise")
+                            (get enterprise_license_price license_tiers)
+                            u0)  ;; Invalid tier
+                    )
+                )
+            )
+            
+            ;; Calculate revenue split
+            (revenue_split (calculate_revenue_distribution tier_price))
+            (content_creator (get content_creator digital_asset))
+            (current_block stacks-block-height)
+        )
+        
+        ;; Validate inputs
+        (asserts! (> asset_identifier u0) ERROR_INVALID_DIGITAL_ASSET_ID)
+        (asserts! (not (is_license_currently_valid tx-sender asset_identifier)) ERROR_ASSET_ALREADY_OWNED)
+        (asserts! (> tier_price u0) ERROR_INVALID_LICENSE_TIER)
+        
+        ;; Transfer funds
+        (try! (transfer_stx_funds tier_price (as-contract tx-sender)))
+        
+        ;; Update creator earnings
+        (map-set creator_earnings
+            { content_creator: content_creator }
+            {
+                accumulated_balance: (+ 
+                    (default-to u0 (get accumulated_balance 
+                        (map-get? creator_earnings { content_creator: content_creator })))
+                    (get creator_share revenue_split))
+            }
+        )
+        
+        ;; Record asset acquisition with tier information
+        (map-set user_asset_licenses
+            { license_holder: tx-sender, asset_identifier: asset_identifier }
+            {
+                acquisition_block_height: current_block,
+                subscription_expiration_block: (if (get supports_subscription digital_asset)
+                                                   (+ current_block (get subscription_period_blocks digital_asset))
+                                                   u0),
+                license_active: true,
+                license_tier: tier
+            }
+        )
+        
+        (ok true)
+    )
+)
+
 (define-public (purchase_digital_asset (asset_identifier uint))
     (let
         (
@@ -115,7 +236,7 @@
         
         (try! (transfer_stx_funds (get purchase_price digital_asset) (as-contract tx-sender)))
         
-        ;; Update creator's earnings
+        ;; Update creator earnings
         (map-set creator_earnings
             { content_creator: content_creator }
             {
@@ -132,7 +253,8 @@
                 subscription_expiration_block: (if (get supports_subscription digital_asset)
                                                    (+ current_block (get subscription_period_blocks digital_asset))
                                                    u0),
-                license_active: true
+                license_active: true,
+                license_tier: "standard"  ;; Default tier for non-tiered purchases
             }
         )
         
@@ -165,8 +287,16 @@
     (map-get? digital_asset_registry { asset_identifier: asset_identifier })
 )
 
-(define-read-only (get_user_asset_license (user principal) (asset_identifier uint))
-    (map-get? user_asset_licenses { license_holder: user, asset_identifier: asset_identifier })
+(define-read-only (get_user_asset_license_details 
+    (user principal) 
+    (asset_identifier uint))
+    (map-get? user_asset_licenses 
+        { license_holder: user, asset_identifier: asset_identifier })
+)
+
+;; Additional read-only function to get licensing tiers for an asset
+(define-read-only (get_asset_licensing_tiers (asset_identifier uint))
+    (map-get? asset_licensing_tiers { asset_identifier: asset_identifier })
 )
 
 (define-read-only (get_creator_current_balance (content_creator principal))
